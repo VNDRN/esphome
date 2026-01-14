@@ -12,6 +12,7 @@ static const char *const TAG = "tormatic.cover";
 using namespace esphome::cover;
 
 void Tormatic::setup() {
+  ESP_LOGI(TAG, "*** CUSTOM TORMATIC COMPONENT - Using modified version with close command fix ***");
   auto restore = this->restore_state_();
   if (restore.has_value()) {
     restore->apply(this);
@@ -34,8 +35,11 @@ void Tormatic::dump_config() {
   LOG_COVER("", "Tormatic Cover", this);
   this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);
 
-  ESP_LOGCONFIG(TAG, "  Open Duration: %.1fs", this->open_duration_ / 1e3f);
-  ESP_LOGCONFIG(TAG, "  Close Duration: %.1fs", this->close_duration_ / 1e3f);
+  ESP_LOGCONFIG(TAG, "  *** CUSTOM TORMATIC COMPONENT - Using modified version ***");
+  ESP_LOGCONFIG(TAG,
+                "  Open Duration: %.1fs\n"
+                "  Close Duration: %.1fs",
+                this->open_duration_ / 1e3f, this->close_duration_ / 1e3f);
 
   auto restore = this->restore_state_();
   if (restore.has_value()) {
@@ -191,18 +195,34 @@ void Tormatic::recompute_position_() {
 
 // Start moving the gate in the direction of the target position.
 void Tormatic::control_position_(float target) {
-  if (target == this->position) {
-    return;
-  }
-
   if (target == COVER_OPEN) {
+    // Only skip if we're actually open (both position and status match).
+    // We check status because position might be stale if status updates
+    // aren't being received properly.
+    if (this->position == COVER_OPEN && this->current_status_ == OPENED) {
+      ESP_LOGD(TAG, "Gate already fully open, skipping command");
+      return;
+    }
     ESP_LOGI(TAG, "Fully opening gate");
     this->send_gate_command_(OPENED);
     return;
   }
   if (target == COVER_CLOSED) {
+    // Only skip if we're actually closed (both position and status match).
+    // We check status because position might be stale if status updates
+    // aren't being received properly. This fixes the issue where close
+    // commands are ignored when the internal position is wrong.
+    if (this->position == COVER_CLOSED && this->current_status_ == CLOSED) {
+      ESP_LOGD(TAG, "Gate already fully closed, skipping command");
+      return;
+    }
     ESP_LOGI(TAG, "Fully closing gate");
     this->send_gate_command_(CLOSED);
+    return;
+  }
+
+  // For intermediate positions, check position only
+  if (target == this->position) {
     return;
   }
 
@@ -249,7 +269,7 @@ void Tormatic::stop_at_target_() {
 // Read a GateStatus from the unit. The unit only sends messages in response to
 // status requests or commands, so a message needs to be sent first.
 optional<GateStatus> Tormatic::read_gate_status_() {
-  if (this->available() < sizeof(MessageHeader)) {
+  if (this->available() < static_cast<int>(sizeof(MessageHeader))) {
     return {};
   }
 
@@ -270,10 +290,13 @@ optional<GateStatus> Tormatic::read_gate_status_() {
       // Read a StatusReply requested by update().
       auto o_status = this->read_data_<StatusReply>();
       if (!o_status) {
+        ESP_LOGD(TAG, "Failed to read status reply");
         return {};
       }
       auto status = o_status.value();
 
+      ESP_LOGD(TAG, "Received status reply: %s (current: %s)", gate_status_to_str(status.state),
+               gate_status_to_str(this->current_status_));
       return status.state;
     }
 
@@ -283,6 +306,7 @@ optional<GateStatus> Tormatic::read_gate_status_() {
       // nor that the motor started moving. A subsequent status request may
       // still return the previous state. Discard these messages, don't use them
       // to drive the Cover state machine.
+      ESP_LOGV(TAG, "Received command echo (discarding)");
       break;
 
     default:
