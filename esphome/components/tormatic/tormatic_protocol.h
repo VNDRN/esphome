@@ -211,17 +211,6 @@ struct StatusReply {
   void byteswap(){};
 } __attribute__((packed));
 
-// Serialize the given object to a new byte vector.
-// Invokes the object's byteswap() method.
-template<typename T> std::vector<uint8_t> serialize(T obj) {
-  obj.byteswap();
-
-  std::vector<uint8_t> out(sizeof(T));
-  memcpy(out.data(), &obj, sizeof(T));
-
-  return out;
-}
-
 // Command tells the gate to start or stop moving.
 // It is echoed back by the unit on success.
 struct CommandRequestReply {

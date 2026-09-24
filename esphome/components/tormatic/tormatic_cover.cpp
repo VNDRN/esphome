@@ -1,5 +1,5 @@
 #include <cinttypes>
-#include <vector>
+#include <cstring>
 
 #include "tormatic_cover.h"
 
@@ -441,12 +441,14 @@ void Tormatic::send_gate_command_(GateStatus s) {
 
 template<typename T> void Tormatic::send_message_(MessageType t, T req) {
   MessageHeader hdr(t, ++this->seq_tx_, sizeof(req));
+  hdr.byteswap();
+  req.byteswap();
 
-  auto out = serialize(hdr);
-  auto reqv = serialize(req);
-  out.insert(out.end(), reqv.begin(), reqv.end());
+  uint8_t out[sizeof(hdr) + sizeof(req)];
+  memcpy(out, &hdr, sizeof(hdr));
+  memcpy(out + sizeof(hdr), &req, sizeof(req));
 
-  this->write_array(out);
+  this->write_array(out, sizeof(out));
 }
 
 template<typename T> optional<T> Tormatic::read_data_() {
