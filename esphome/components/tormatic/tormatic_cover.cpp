@@ -13,10 +13,13 @@ static const char *const TAG = "tormatic.cover";
 // 12-byte message takes ~12.5ms, so 15ms guarantees all bytes have arrived.
 static constexpr uint32_t DRAIN_TIMEOUT_MS = 15;
 
-// How often to probe the light page, and how long to wait for its reply before
+// How often to poll the light page, and how long to wait for its reply before
 // giving up on the pending sequence number.
-static constexpr uint32_t LIGHT_PROBE_INTERVAL_MS = 5000;
-static constexpr uint32_t LIGHT_PROBE_TIMEOUT_MS = 2000;
+static constexpr uint32_t LIGHT_STATUS_INTERVAL_MS = 5000;
+static constexpr uint32_t LIGHT_STATUS_TIMEOUT_MS = 2000;
+// How long after a light command to poll the light page again. The command
+// echo doesn't confirm the light switched, only a status reply does.
+static constexpr uint32_t LIGHT_COMMAND_SETTLE_MS = 500;
 
 using namespace esphome::cover;
 
@@ -55,21 +58,22 @@ void Tormatic::dump_config() {
 void Tormatic::update() {
   const uint32_t now = millis();
 
-  // Expire a probe that never got an answer, so its sequence number can't be
-  // matched against an unrelated reply much later.
-  if (this->light_probe_seq_.has_value() && (now - this->light_probe_sent_time_) > LIGHT_PROBE_TIMEOUT_MS) {
-    ESP_LOGI(TAG, "Light probe (seq %u) went unanswered", static_cast<unsigned>(this->light_probe_seq_.value()));
-    this->light_probe_seq_.reset();
+  // Expire a light status request that never got an answer, so its sequence
+  // number can't be matched against an unrelated reply much later.
+  if (this->light_status_seq_.has_value() && (now - this->light_status_sent_time_) > LIGHT_STATUS_TIMEOUT_MS) {
+    ESP_LOGW(TAG, "Light status request (seq %u) went unanswered",
+             static_cast<unsigned>(this->light_status_seq_.value()));
+    this->light_status_seq_.reset();
   }
 
-  // Probe the light page only while the gate is idle. Status requests for
+  // Poll the light page only while the gate is idle. Status requests for
   // other pages during movement are reported to confuse the drive firmware
-  // into stopping, and stopping the gate unexpectedly is not an acceptable
-  // cost for a diagnostic.
-  if (this->current_operation == COVER_OPERATION_IDLE && !this->light_probe_seq_.has_value() &&
-      (now - this->last_light_probe_time_) >= LIGHT_PROBE_INTERVAL_MS) {
-    this->last_light_probe_time_ = now;
-    this->request_light_probe_();
+  // into stopping the gate.
+  if (!this->light_state_callback_.empty() && !this->light_unsupported_ &&
+      this->current_operation == COVER_OPERATION_IDLE && !this->light_status_seq_.has_value() &&
+      (now - this->last_light_status_time_) >= LIGHT_STATUS_INTERVAL_MS) {
+    this->last_light_status_time_ = now;
+    this->request_light_status_();
     return;
   }
 
@@ -329,14 +333,11 @@ optional<GateStatus> Tormatic::read_gate_status_() {
         return {};
       }
 
-      // A reply carrying the light probe's sequence number describes the light
-      // page, not the gate. Log the payload raw and keep it away from the
-      // cover state machine.
-      if (this->light_probe_seq_.has_value() && hdr.seq == this->light_probe_seq_.value()) {
-        this->light_probe_seq_.reset();
-        ESP_LOGI(TAG, "Light probe reply (seq %u): ack=0x%02X state=0x%02X trailer=0x%02X",
-                 static_cast<unsigned>(hdr.seq), static_cast<unsigned>(o_status->ack),
-                 static_cast<unsigned>(o_status->state), static_cast<unsigned>(o_status->trailer));
+      // A reply carrying the light request's sequence number describes the
+      // light page, not the gate. Keep it away from the cover state machine.
+      if (this->light_status_seq_.has_value() && hdr.seq == this->light_status_seq_.value()) {
+        this->light_status_seq_.reset();
+        this->handle_light_status_(o_status->trailer);
         return {};
       }
 
@@ -345,12 +346,11 @@ optional<GateStatus> Tormatic::read_gate_status_() {
 
     case COMMAND:
       // The drive answers a request for an unsupported page with an error
-      // frame typed as a command. Report it against the probe rather than
-      // discarding it silently as a command echo.
-      if (this->light_probe_seq_.has_value() && hdr.seq == this->light_probe_seq_.value()) {
-        this->light_probe_seq_.reset();
-        ESP_LOGW(TAG, "Light probe (seq %u) rejected: drive answered with an error frame",
-                 static_cast<unsigned>(hdr.seq));
+      // frame typed as a command. Such a drive has no light, stop asking.
+      if (this->light_status_seq_.has_value() && hdr.seq == this->light_status_seq_.value()) {
+        this->light_status_seq_.reset();
+        this->light_unsupported_ = true;
+        ESP_LOGW(TAG, "Drive rejected the light status request, it has no light. Stopped polling the light");
         break;
       }
       // Commands initiated by control() are simply echoed back by the unit, but
@@ -381,18 +381,51 @@ void Tormatic::request_gate_status_() {
 }
 
 // Send a status request for the light page and remember its sequence number so
-// the reply can be told apart from a gate status. Diagnostic only: this asks
-// the drive a question, it never tells it to do anything.
-void Tormatic::request_light_probe_() {
+// the reply can be told apart from a gate status.
+void Tormatic::request_light_status_() {
   // send_message_ pre-increments seq_tx_, and MessageHeader truncates it to 16
   // bits, so this is the sequence number the request will carry.
-  this->light_probe_seq_ = static_cast<uint16_t>(this->seq_tx_ + 1);
-  this->light_probe_sent_time_ = millis();
+  this->light_status_seq_ = static_cast<uint16_t>(this->seq_tx_ + 1);
+  this->light_status_sent_time_ = millis();
 
-  ESP_LOGD(TAG, "Probing light page 0x%02X (seq %u)", static_cast<unsigned>(LIGHT),
-           static_cast<unsigned>(this->light_probe_seq_.value()));
+  ESP_LOGV(TAG, "Requesting light status (seq %u)", static_cast<unsigned>(this->light_status_seq_.value()));
   StatusRequest req(LIGHT);
   this->send_message_(STATUS, req);
+}
+
+// Notify subscribers when the light state reported by the drive changes.
+void Tormatic::handle_light_status_(uint8_t raw) {
+  if (raw != LIGHT_OFF && raw != LIGHT_ON) {
+    ESP_LOGW(TAG, "Ignoring unexpected light state 0x%02X", raw);
+    return;
+  }
+
+  const bool on = raw == LIGHT_ON;
+  if (this->light_state_.has_value() && this->light_state_.value() == on) {
+    return;
+  }
+
+  ESP_LOGI(TAG, "Light changed to %s", light_state_to_str(static_cast<LightState>(raw)));
+  this->light_state_ = on;
+  this->light_state_callback_.call(on);
+}
+
+void Tormatic::send_light_command(bool on) {
+  // Treat light commands like light status requests: the drive is reported to
+  // stop unexpectedly when addressed on other pages during movement.
+  if (this->current_operation != COVER_OPERATION_IDLE) {
+    ESP_LOGW(TAG, "Not switching the light while the gate is moving");
+    return;
+  }
+
+  const LightState state = on ? LIGHT_ON : LIGHT_OFF;
+  ESP_LOGI(TAG, "Sending light command %s", light_state_to_str(state));
+  LightCommandRequestReply req(state);
+  this->send_message_(COMMAND, req);
+
+  // Poll the light again shortly instead of after a full interval, so the
+  // outcome of the command is reported quickly.
+  this->last_light_status_time_ = millis() - LIGHT_STATUS_INTERVAL_MS + LIGHT_COMMAND_SETTLE_MS;
 }
 
 // Send a message to the unit issuing a command.
@@ -400,6 +433,10 @@ void Tormatic::send_gate_command_(GateStatus s) {
   ESP_LOGI(TAG, "Sending gate command %s", gate_status_to_str(s));
   CommandRequestReply req(s);
   this->send_message_(COMMAND, req);
+
+  // The gate may start moving before a status reply reports it. Hold off the
+  // light poll until the cover operation reflects that.
+  this->last_light_status_time_ = millis();
 }
 
 template<typename T> void Tormatic::send_message_(MessageType t, T req) {

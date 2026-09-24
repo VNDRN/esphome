@@ -19,6 +19,12 @@ class Tormatic final : public cover::Cover, public uart::UARTDevice, public Poll
   void set_open_duration(uint32_t duration) { this->open_duration_ = duration; }
   void set_close_duration(uint32_t duration) { this->close_duration_ = duration; }
 
+  // The light is only polled once something subscribes to its state.
+  void add_on_light_state_callback(std::function<void(bool)> &&callback) {
+    this->light_state_callback_.add(std::move(callback));
+  }
+  void send_light_command(bool on);
+
   void publish_state(bool save = true, uint32_t ratelimit = 0);
 
   cover::CoverTraits get_traits() override;
@@ -38,9 +44,8 @@ class Tormatic final : public cover::Cover, public uart::UARTDevice, public Poll
   void request_gate_status_();
   optional<GateStatus> read_gate_status_();
 
-  // Light probe. Sends a status request for the LIGHT page and logs whatever
-  // comes back. Read-only: no light commands are issued anywhere.
-  void request_light_probe_();
+  void request_light_status_();
+  void handle_light_status_(uint8_t raw);
 
   void send_gate_command_(GateStatus s);
   void handle_gate_status_(GateStatus s);
@@ -48,12 +53,15 @@ class Tormatic final : public cover::Cover, public uart::UARTDevice, public Poll
   uint32_t seq_tx_{0};
   optional<MessageHeader> pending_hdr_{};
 
-  // Sequence number of the light probe awaiting a reply, and when it was sent.
-  // Replies are matched on the header's sequence number so a probe reply can
-  // never be mistaken for a gate status.
-  optional<uint16_t> light_probe_seq_{};
-  uint32_t light_probe_sent_time_{0};
-  uint32_t last_light_probe_time_{0};
+  // Sequence number of the light status request awaiting a reply, and when it
+  // was sent. Replies are matched on the header's sequence number, which the
+  // drive echoes, so a light reply can never be mistaken for a gate status.
+  optional<uint16_t> light_status_seq_{};
+  uint32_t light_status_sent_time_{0};
+  uint32_t last_light_status_time_{0};
+  bool light_unsupported_{false};
+  optional<bool> light_state_{};
+  LazyCallbackManager<void(bool)> light_state_callback_;
 
   GateStatus current_status_{PAUSED};
 

@@ -18,10 +18,8 @@
  * | 0xF3 0xCB | 0x00 0x00 0x00 0x06 | 0x01 0x04 | 0x00 0x0A 0x00 0x01 |
  * | 0xF3 0xCB | 0x00 0x00 0x00 0x05 | 0x01 0x04 | 0x02 0x03 0x00      |
  *
- * This request asks for the gate status (0x0A); the only other value observed
- * in the request was 0x0B, but replies were always zero. Presumably this
- * queries another sensor on the unit like a safety breaker, but this is not
- * relevant for an esphome cover component.
+ * This request asks for the gate status (0x0A). Page 0x0B addresses the
+ * drive's light on units that have one, see LightState below.
  *
  * The second byte of the reply is set to 0x03 when the gate is in fully open
  * position. Other valid values for the second byte are: (0x0) Paused, (0x1)
@@ -44,6 +42,13 @@
  * Close, (0x2) Ventilate (open ~20%), (0x3) Open/high-torque reverse. The
  * protocol implementation in this file simply reuses the GateStatus enum
  * for this purpose.
+ *
+ * Controlling the light uses the same command layout on page 0x0B, with 0x01
+ * for on and 0x00 for off. Like gate commands, the echo does not confirm the
+ * light switched; only a status reply for page 0x0B is authoritative.
+ *
+ * Requesting an unsupported page is answered with an error frame typed as a
+ * command: 0x00 0x00 0x00 0x04 | 0x01 0x06 | 0x86 0x02.
  */
 
 namespace esphome::tormatic {
@@ -104,13 +109,7 @@ struct MessageHeader {
 } __attribute__((packed));
 
 // StatusType denotes which 'page' of information needs to be retrieved.
-// On my Novoferm 423, only the GATE status type returns values, Unknown
-// only contains zeroes.
-//
-// 0x0B is reported to address the drive's light on units that have one, with
-// the state carried in the third payload byte of the status reply. Units
-// without a light answer with zeroes, which is what the 423 above saw. The
-// LIGHT name is provisional until a reply proves it on real hardware.
+// The Novoferm 423 has no light, so it answers the LIGHT page with zeroes.
 enum StatusType : uint16_t {
   GATE = 0x0A,
   LIGHT = 0x0B,
@@ -157,6 +156,26 @@ inline const char *gate_status_to_str(GateStatus s) {
       return "Opening";
     case CLOSING:
       return "Closing";
+    default:
+      return "Unknown";
+  }
+}
+
+// LightState is carried in the trailer byte of a StatusReply for the LIGHT
+// page, and sent in a LightCommandRequestReply. The drive also turns the
+// light on by itself while the gate moves, followed by a courtesy timer.
+enum LightState : uint8_t {
+  LIGHT_OFF = 0,
+  LIGHT_ON = 1,
+};
+
+// Max string length: 7 ("Unknown"). Update print() buffer sizes if adding longer strings.
+inline const char *light_state_to_str(LightState s) {
+  switch (s) {
+    case LIGHT_OFF:
+      return "Off";
+    case LIGHT_ON:
+      return "On";
     default:
       return "Unknown";
   }
@@ -223,6 +242,26 @@ struct CommandRequestReply {
     // 56 bytes: "CommandRequestReply: state " (27) + state (11) + safety margin
     char buf[56];
     buf_append_printf(buf, sizeof(buf), 0, "CommandRequestReply: state %s", gate_status_to_str(this->state));
+    return buf;
+  }
+
+  void byteswap() { this->type = convert_big_endian(this->type); }
+} __attribute__((packed));
+
+// LightCommandRequestReply tells the drive to switch its light on or off.
+// It is echoed back by the unit, which does not mean the light switched.
+struct LightCommandRequestReply {
+  StatusType type = LIGHT;
+  uint8_t pad = 0x0;
+  LightState state;
+
+  LightCommandRequestReply() = default;
+  LightCommandRequestReply(LightState state) { this->state = state; }
+
+  std::string print() {
+    // 48 bytes: "LightCommandRequestReply: state " (32) + state (7) + safety margin
+    char buf[48];
+    buf_append_printf(buf, sizeof(buf), 0, "LightCommandRequestReply: state %s", light_state_to_str(this->state));
     return buf;
   }
 
