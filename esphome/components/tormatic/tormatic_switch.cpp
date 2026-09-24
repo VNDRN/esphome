@@ -8,6 +8,7 @@ namespace esphome::tormatic {
 
 static const char *const TAG = "tormatic.switch";
 
+// Restore mode is never applied: restoring would send a light command on boot.
 void TormaticSwitch::setup() {
   this->parent_->add_on_light_state_callback([this](bool state) { this->publish_state(state); });
 }

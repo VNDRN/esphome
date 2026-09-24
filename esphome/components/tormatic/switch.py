@@ -11,7 +11,9 @@ TormaticSwitch = tormatic_ns.class_(
 )
 
 CONFIG_SCHEMA = (
-    switch.switch_schema(TormaticSwitch, icon=ICON_LIGHTBULB)
+    switch.switch_schema(
+        TormaticSwitch, default_restore_mode="DISABLED", icon=ICON_LIGHTBULB
+    )
     .extend(
         {
             cv.GenerateID(CONF_TORMATIC_ID): cv.use_id(Tormatic),
