@@ -38,11 +38,22 @@ class Tormatic final : public cover::Cover, public uart::UARTDevice, public Poll
   void request_gate_status_();
   optional<GateStatus> read_gate_status_();
 
+  // Light probe. Sends a status request for the LIGHT page and logs whatever
+  // comes back. Read-only: no light commands are issued anywhere.
+  void request_light_probe_();
+
   void send_gate_command_(GateStatus s);
   void handle_gate_status_(GateStatus s);
 
   uint32_t seq_tx_{0};
   optional<MessageHeader> pending_hdr_{};
+
+  // Sequence number of the light probe awaiting a reply, and when it was sent.
+  // Replies are matched on the header's sequence number so a probe reply can
+  // never be mistaken for a gate status.
+  optional<uint16_t> light_probe_seq_{};
+  uint32_t light_probe_sent_time_{0};
+  uint32_t last_light_probe_time_{0};
 
   GateStatus current_status_{PAUSED};
 

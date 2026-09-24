@@ -106,9 +106,14 @@ struct MessageHeader {
 // StatusType denotes which 'page' of information needs to be retrieved.
 // On my Novoferm 423, only the GATE status type returns values, Unknown
 // only contains zeroes.
+//
+// 0x0B is reported to address the drive's light on units that have one, with
+// the state carried in the third payload byte of the status reply. Units
+// without a light answer with zeroes, which is what the 423 above saw. The
+// LIGHT name is provisional until a reply proves it on real hardware.
 enum StatusType : uint16_t {
   GATE = 0x0A,
-  UNKNOWN = 0x0B,
+  LIGHT = 0x0B,
 };
 
 // GateStatus defines the current state of the gate, received in a StatusReply
