@@ -184,6 +184,15 @@ void Tormatic::handle_gate_status_(GateStatus s) {
     case CLOSED:
       this->position = COVER_CLOSED;
       break;
+    case OPENING:
+    case CLOSING:
+      // The drive switches its light on whenever the gate moves, but the light
+      // can't be polled during movement. Report it on until the first poll
+      // after the gate stops says otherwise.
+      if (!this->light_state_callback_.empty() && !this->light_unsupported_) {
+        this->set_light_state_(true);
+      }
+      break;
     default:
       break;
   }
@@ -400,12 +409,15 @@ void Tormatic::handle_light_status_(uint8_t raw) {
     return;
   }
 
-  const bool on = raw == LIGHT_ON;
+  this->set_light_state_(raw == LIGHT_ON);
+}
+
+void Tormatic::set_light_state_(bool on) {
   if (this->light_state_.has_value() && this->light_state_.value() == on) {
     return;
   }
 
-  ESP_LOGI(TAG, "Light changed to %s", light_state_to_str(static_cast<LightState>(raw)));
+  ESP_LOGI(TAG, "Light changed to %s", light_state_to_str(on ? LIGHT_ON : LIGHT_OFF));
   this->light_state_ = on;
   this->light_state_callback_.call(on);
 }
@@ -435,8 +447,11 @@ void Tormatic::send_gate_command_(GateStatus s) {
   this->send_message_(COMMAND, req);
 
   // The gate may start moving before a status reply reports it. Hold off the
-  // light poll until the cover operation reflects that.
-  this->last_light_status_time_ = millis();
+  // light poll until the cover operation reflects that. Pausing can't start the
+  // gate, and is sent right after it opens, so it mustn't delay the next poll.
+  if (s != PAUSED) {
+    this->last_light_status_time_ = millis();
+  }
 }
 
 template<typename T> void Tormatic::send_message_(MessageType t, T req) {
