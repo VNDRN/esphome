@@ -1,18 +1,21 @@
+#include <cinttypes>
 #include <vector>
 
 #include "tormatic_cover.h"
 
 using namespace std;
 
-namespace esphome {
-namespace tormatic {
+namespace esphome::tormatic {
 
 static const char *const TAG = "tormatic.cover";
+
+// Time to poll the UART when flushing after desync. At 9600 baud, a full
+// 12-byte message takes ~12.5ms, so 15ms guarantees all bytes have arrived.
+static constexpr uint32_t DRAIN_TIMEOUT_MS = 15;
 
 using namespace esphome::cover;
 
 void Tormatic::setup() {
-  ESP_LOGI(TAG, "*** CUSTOM TORMATIC COMPONENT - Using modified version with close command fix ***");
   auto restore = this->restore_state_();
   if (restore.has_value()) {
     restore->apply(this);
@@ -33,9 +36,6 @@ cover::CoverTraits Tormatic::get_traits() {
 
 void Tormatic::dump_config() {
   LOG_COVER("", "Tormatic Cover", this);
-  this->check_uart_settings(9600, 1, uart::UART_CONFIG_PARITY_NONE, 8);
-
-  ESP_LOGCONFIG(TAG, "  *** CUSTOM TORMATIC COMPONENT - Using modified version ***");
   ESP_LOGCONFIG(TAG,
                 "  Open Duration: %.1fs\n"
                 "  Close Duration: %.1fs",
@@ -47,25 +47,15 @@ void Tormatic::dump_config() {
   }
 }
 
-void Tormatic::update() {
-  ESP_LOGD(TAG, "update() called - polling for gate status (available bytes: %d)", this->available());
-  this->request_gate_status_();
-}
+void Tormatic::update() { this->request_gate_status_(); }
 
 void Tormatic::loop() {
-  int available = this->available();
-  if (available > 0) {
-    ESP_LOGD(TAG, "loop() - %d bytes available, attempting to read status", available);
-  }
-  
   auto o_status = this->read_gate_status_();
   if (o_status) {
     auto status = o_status.value();
 
     this->recalibrate_duration_(status);
     this->handle_gate_status_(status);
-  } else if (available > 0) {
-    ESP_LOGW(TAG, "loop() - Had %d bytes available but failed to read valid status message", available);
   }
 
   this->recompute_position_();
@@ -78,8 +68,9 @@ void Tormatic::control(const cover::CoverCall &call) {
     return;
   }
 
-  if (call.get_position().has_value()) {
-    auto pos = call.get_position().value();
+  auto pos_val = call.get_position();
+  if (pos_val.has_value()) {
+    auto pos = *pos_val;
     this->control_position_(pos);
     return;
   }
@@ -131,11 +122,11 @@ void Tormatic::recalibrate_duration_(GateStatus s) {
 
   if (s == OPENED) {
     this->open_duration_ = now - this->direction_start_time_;
-    ESP_LOGI(TAG, "Recalibrated the gate's open duration to %dms", this->open_duration_);
+    ESP_LOGI(TAG, "Recalibrated the gate's open duration to %" PRIu32 "ms", this->open_duration_);
   }
   if (s == CLOSED) {
     this->close_duration_ = now - this->direction_start_time_;
-    ESP_LOGI(TAG, "Recalibrated the gate's close duration to %dms", this->close_duration_);
+    ESP_LOGI(TAG, "Recalibrated the gate's close duration to %" PRIu32 "ms", this->close_duration_);
   }
 
   this->direction_start_time_ = 0;
@@ -194,6 +185,9 @@ void Tormatic::recompute_position_() {
     duration = this->close_duration_;
   }
 
+  if (duration == 0)
+    return;
+
   auto delta = direction * diff / duration;
 
   this->position = clamp(this->position + delta, COVER_CLOSED, COVER_OPEN);
@@ -205,34 +199,18 @@ void Tormatic::recompute_position_() {
 
 // Start moving the gate in the direction of the target position.
 void Tormatic::control_position_(float target) {
+  if (target == this->position) {
+    return;
+  }
+
   if (target == COVER_OPEN) {
-    // Only skip if we're actually open (both position and status match).
-    // We check status because position might be stale if status updates
-    // aren't being received properly.
-    if (this->position == COVER_OPEN && this->current_status_ == OPENED) {
-      ESP_LOGD(TAG, "Gate already fully open, skipping command");
-      return;
-    }
     ESP_LOGI(TAG, "Fully opening gate");
     this->send_gate_command_(OPENED);
     return;
   }
   if (target == COVER_CLOSED) {
-    // Only skip if we're actually closed (both position and status match).
-    // We check status because position might be stale if status updates
-    // aren't being received properly. This fixes the issue where close
-    // commands are ignored when the internal position is wrong.
-    if (this->position == COVER_CLOSED && this->current_status_ == CLOSED) {
-      ESP_LOGD(TAG, "Gate already fully closed, skipping command");
-      return;
-    }
     ESP_LOGI(TAG, "Fully closing gate");
     this->send_gate_command_(CLOSED);
-    return;
-  }
-
-  // For intermediate positions, check position only
-  if (target == this->position) {
     return;
   }
 
@@ -279,98 +257,85 @@ void Tormatic::stop_at_target_() {
 // Read a GateStatus from the unit. The unit only sends messages in response to
 // status requests or commands, so a message needs to be sent first.
 optional<GateStatus> Tormatic::read_gate_status_() {
-  int available_bytes = this->available();
-  if (available_bytes < static_cast<int>(sizeof(MessageHeader))) {
-    if (available_bytes > 0) {
-      ESP_LOGD(TAG, "Insufficient bytes available: %d (need %d), waiting for more data", available_bytes,
-               static_cast<int>(sizeof(MessageHeader)));
+  if (!this->pending_hdr_) {
+    if (this->available() < sizeof(MessageHeader)) {
+      return {};
     }
+
+    this->pending_hdr_ = this->read_data_<MessageHeader>();
+    if (!this->pending_hdr_) {
+      return {};
+    }
+
+    // Sanity check: valid messages have small payloads (3-4 bytes). A large
+    // or impossible payload_size means the stream is out of sync (corrupted
+    // byte, dropped data, etc.). Flush the buffer so we can resync on the
+    // next request/response cycle.
+    if (this->pending_hdr_->payload_size() > sizeof(CommandRequestReply)) {
+      ESP_LOGW(TAG, "Unexpected payload size %" PRIu32 ", flushing rx buffer", this->pending_hdr_->payload_size());
+      this->pending_hdr_.reset();
+      this->drain_rx_();
+      return {};
+    }
+  }
+
+  auto hdr = this->pending_hdr_.value();
+
+  // Wait for all payload bytes to arrive before processing.
+  if (this->available() < hdr.payload_size()) {
     return {};
   }
 
-  ESP_LOGD(TAG, "Reading message header, %d bytes available in buffer", available_bytes);
-  auto o_hdr = this->read_data_<MessageHeader>();
-  if (!o_hdr) {
-    ESP_LOGE(TAG, "Timeout reading message header after %d bytes were available", available_bytes);
-    return {};
-  }
-  auto hdr = o_hdr.value();
-
-  ESP_LOGI(TAG, "Received message header: seq=%d, len=%d, type=%s (0x%04x), payload_size=%d", hdr.seq, hdr.len,
-           message_type_to_str(hdr.type), hdr.type, hdr.payload_size());
+  this->pending_hdr_.reset();
 
   switch (hdr.type) {
     case STATUS: {
       if (hdr.payload_size() != sizeof(StatusReply)) {
-        ESP_LOGE(TAG, "Header specifies payload size %d but size of StatusReply is %d", hdr.payload_size(),
+        ESP_LOGE(TAG, "Header specifies payload size %" PRIu32 " but size of StatusReply is %zu", hdr.payload_size(),
                  sizeof(StatusReply));
-      }
-
-      ESP_LOGD(TAG, "Reading status reply payload (%d bytes expected)", sizeof(StatusReply));
-      // Read a StatusReply requested by update().
-      auto o_status = this->read_data_<StatusReply>();
-      if (!o_status) {
-        ESP_LOGE(TAG, "Failed to read status reply payload");
+        this->drain_rx_(hdr.payload_size());
         return {};
       }
-      auto status = o_status.value();
 
-      ESP_LOGI(TAG, "*** STATUS REPLY RECEIVED *** State: %s (ack=0x%02x, trailer=0x%02x) [current: %s]",
-               gate_status_to_str(status.state), status.ack, status.trailer, gate_status_to_str(this->current_status_));
-      return status.state;
+      auto o_status = this->read_data_<StatusReply>();
+      if (!o_status) {
+        return {};
+      }
+
+      return o_status->state;
     }
 
-    case COMMAND: {
+    case COMMAND:
       // Commands initiated by control() are simply echoed back by the unit, but
       // don't guarantee that the unit's internal state has been transitioned,
       // nor that the motor started moving. A subsequent status request may
       // still return the previous state. Discard these messages, don't use them
       // to drive the Cover state machine.
-      ESP_LOGI(TAG, "Received command echo (discarding), payload_size=%d", hdr.payload_size());
-      
-      // Read and log the command echo for debugging
-      if (hdr.payload_size() >= sizeof(CommandRequestReply)) {
-        auto o_cmd = this->read_data_<CommandRequestReply>();
-        if (o_cmd) {
-          auto cmd = o_cmd.value();
-          ESP_LOGI(TAG, "Command echo details: %s", cmd.print().c_str());
-        } else {
-          ESP_LOGE(TAG, "Failed to read command echo payload");
-        }
-      } else {
-        ESP_LOGW(TAG, "Command echo payload size %d is smaller than expected %d", hdr.payload_size(),
-                 sizeof(CommandRequestReply));
-        this->drain_rx_(hdr.payload_size());
-      }
       break;
-    }
 
     default:
       // Unknown message type, drain the remaining amount of bytes specified in
       // the header.
-      ESP_LOGE(TAG, "*** UNKNOWN MESSAGE TYPE *** Type: 0x%04x, payload_size: %d", hdr.type, hdr.payload_size());
-      ESP_LOGD(TAG, "Draining %d bytes of unknown message payload", hdr.payload_size());
+      ESP_LOGE(TAG, "Reading remaining %" PRIu32 " payload bytes of unknown type 0x%x", hdr.payload_size(), hdr.type);
       break;
   }
 
   // Drain any unhandled payload bytes described by the message header, if any.
-  if (hdr.payload_size() > 0) {
-    this->drain_rx_(hdr.payload_size());
-  }
+  this->drain_rx_(hdr.payload_size());
 
   return {};
 }
 
 // Send a message to the unit requesting the gate's status.
 void Tormatic::request_gate_status_() {
-  ESP_LOGD(TAG, "*** SENDING STATUS REQUEST *** (seq will be %d)", this->seq_tx_ + 1);
+  ESP_LOGV(TAG, "Requesting gate status");
   StatusRequest req(GATE);
   this->send_message_(STATUS, req);
 }
 
 // Send a message to the unit issuing a command.
 void Tormatic::send_gate_command_(GateStatus s) {
-  ESP_LOGI(TAG, "*** SENDING GATE COMMAND *** %s (seq will be %d)", gate_status_to_str(s), this->seq_tx_ + 1);
+  ESP_LOGI(TAG, "Sending gate command %s", gate_status_to_str(s));
   CommandRequestReply req(s);
   this->send_message_(COMMAND, req);
 }
@@ -382,62 +347,44 @@ template<typename T> void Tormatic::send_message_(MessageType t, T req) {
   auto reqv = serialize(req);
   out.insert(out.end(), reqv.begin(), reqv.end());
 
-  // Log the message being sent
-  ESP_LOGD(TAG, "Sending message: type=%s, seq=%d, total_size=%d bytes", message_type_to_str(t), hdr.seq, out.size());
-  char hex_str[out.size() * 3 + 1] = {0};
-  for (size_t i = 0; i < out.size() && i < 32; i++) {  // Limit to first 32 bytes to avoid huge logs
-    sprintf(hex_str + i * 3, "%02x ", out[i]);
-  }
-  if (out.size() > 32) {
-    ESP_LOGD(TAG, "  First 32 bytes: %s... (total %d bytes)", hex_str, out.size());
-  } else {
-    ESP_LOGD(TAG, "  Full message: %s", hex_str);
-  }
-
   this->write_array(out);
-  ESP_LOGD(TAG, "Message sent successfully");
 }
 
 template<typename T> optional<T> Tormatic::read_data_() {
   T obj;
   uint32_t start = millis();
 
-  ESP_LOGD(TAG, "Attempting to read %d bytes from UART", sizeof(obj));
   auto ok = this->read_array((uint8_t *) &obj, sizeof(obj));
   if (!ok) {
-    ESP_LOGE(TAG, "Failed to read %d bytes from UART (timeout after %d ms)", sizeof(obj), millis() - start);
+    // Couldn't read object successfully, timeout?
     return {};
   }
-  
-  // Log raw bytes before byteswap for debugging
-  ESP_LOGD(TAG, "Read raw bytes (before byteswap):");
-  uint8_t *raw = (uint8_t *) &obj;
-  char hex_str[sizeof(T) * 3 + 1] = {0};
-  for (size_t i = 0; i < sizeof(T); i++) {
-    sprintf(hex_str + i * 3, "%02x ", raw[i]);
-  }
-  ESP_LOGD(TAG, "  %s", hex_str);
-  
   obj.byteswap();
 
-  uint32_t elapsed = millis() - start;
-  ESP_LOGD(TAG, "Successfully read %s in %d ms", obj.print().c_str(), elapsed);
+  ESP_LOGV(TAG, "Read %s in %" PRIu32 " ms", obj.print().c_str(), millis() - start);
   return obj;
 }
 
-// Drain up to n amount of bytes from the uart rx buffer.
+// Drain bytes from the uart rx buffer. When n > 0, drain exactly n bytes
+// (caller must ensure they are available). When n == 0, poll for 15ms to
+// guarantee a full packet time at 9600 baud has elapsed, consuming any
+// bytes still in transit.
 void Tormatic::drain_rx_(uint16_t n) {
   uint8_t data;
-  uint16_t count = 0;
-  while (this->available()) {
-    this->read_byte(&data);
-    count++;
-
-    if (n > 0 && count >= n) {
-      return;
+  if (n > 0) {
+    for (uint16_t i = 0; i < n; i++) {
+      if (!this->read_byte(&data)) {
+        return;
+      }
+    }
+  } else {
+    uint32_t start = millis();
+    while (millis() - start < DRAIN_TIMEOUT_MS) {
+      if (this->available()) {
+        this->read_byte(&data);
+      }
     }
   }
 }
 
-}  // namespace tormatic
-}  // namespace esphome
+}  // namespace esphome::tormatic
